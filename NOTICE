@@ -1,0 +1,4 @@
+Cindrix Overwatch Cam is based on ancamera by jestemkojak (MIT License):
+https://github.com/jestemkojak/ancamera
+The original license text is kept in LICENSE. Changes by Cindrix: new name, package, colors, icon and documentation.
+It uses the RootEncoder and RTSP-Server libraries by pedroSG94 (Apache 2.0).
