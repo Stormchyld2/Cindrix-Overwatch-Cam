@@ -17,7 +17,10 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.7.1'
-      - uses: android-actions/setup-android@v3
+      - name: Use runner Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --version
       - name: Install Android SDK
         run: sdkmanager "platforms;android-37" "build-tools;37.0.0"
       - name: Prepare unchanged Cindrix logo
