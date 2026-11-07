@@ -1,0 +1,128 @@
+package com.cindrix.overwatchcam.stream
+
+import android.content.Context
+import android.hardware.Camera
+import android.media.MediaCodec
+import android.os.Build
+import android.util.Log
+import androidx.annotation.RequiresApi
+import com.pedro.common.AudioCodec
+import com.pedro.common.ConnectChecker
+import com.pedro.common.VideoCodec
+import com.pedro.encoder.input.video.Camera1ApiManager
+import com.pedro.library.base.Camera1Base
+import com.pedro.rtspserver.server.RtspServer
+import com.pedro.rtspserver.util.RtspServerStreamClient
+import java.nio.ByteBuffer
+
+/**
+ * App copy of the library class `com.pedro.rtspserver.RtspServerCamera1` (RTSP-Server 1.4.3).
+ *
+ * It exists to work around a bug on API < 21: MediaCodec does not set `position`/`limit` on the
+ * buffers from `getOutputBuffers()` from `BufferInfo`, so `getVideoDataImp` gets a buffer whose
+ * limit is the full output buffer capacity (1-2 MB), not the frame size (about 10-50 KB). The
+ * library sender copies `[0, limit())` per frame, so each frame took a 2 MB array, and the 128 MB
+ * heap on the LG G3 (API 19) ran out of memory after a short network delay filled the send queue.
+ *
+ * This class trims the buffer to the real frame before it reaches the library, using
+ * [trimFrame]. The library class is final, so it cannot be subclassed; this is a copy with only
+ * [getVideoDataImp] changed.
+ *
+ * Only the background constructor is here, because the app uses only that one.
+ */
+class TrimmedRtspServerCamera1 : Camera1Base {
+
+    private val rtspServer: RtspServer
+    // Only the encoder output thread uses this counter.
+    private var droppedFrames = 0L
+
+    @RequiresApi(api = Build.VERSION_CODES.JELLY_BEAN_MR2)
+    constructor(context: Context, connectChecker: ConnectChecker, port: Int) : super(context) {
+        rtspServer = RtspServer(connectChecker, port)
+    }
+
+    fun startStream() {
+        super.startStream("")
+    }
+
+    override fun onAudioInfoImp(isStereo: Boolean, sampleRate: Int) {
+        rtspServer.setAudioInfo(sampleRate, isStereo)
+    }
+
+    override fun startStreamImp(url: String) {
+        rtspServer.startServer()
+    }
+
+    override fun stopStreamImp() {
+        rtspServer.stopServer()
+    }
+
+    override fun getAudioDataImp(audioBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+        rtspServer.sendAudio(audioBuffer, info)
+    }
+
+    override fun onVideoInfoImp(sps: ByteBuffer, pps: ByteBuffer?, vps: ByteBuffer?) {
+        val newSps = sps.duplicate()
+        val newPps = pps?.duplicate()
+        val newVps = vps?.duplicate()
+        rtspServer.setVideoInfo(newSps, newPps, newVps)
+    }
+
+    // Trims the frame out of the encoder's output buffer before it reaches the library, so the
+    // library never copies the unused rest of the buffer. The trimmed buffer starts at the frame,
+    // so its own BufferInfo carries offset 0. size, presentationTimeUs and flags come from
+    // [info]. This copy of info does not change the encoder's own [info]. A frame whose range is
+    // not in the buffer is dropped.
+    override fun getVideoDataImp(videoBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+        val trimmed = trimFrame(videoBuffer, info.offset, info.size) ?: run {
+            droppedFrames++
+            if (droppedFrames == 1L || droppedFrames % 100 == 0L) {
+                Log.w(TAG, "dropped $droppedFrames video frame(s) with a bad range: offset ${info.offset}, " +
+                    "size ${info.size}, capacity ${videoBuffer.capacity()}")
+            }
+            return
+        }
+        val trimmedInfo = MediaCodec.BufferInfo().apply {
+            set(0, info.size, info.presentationTimeUs, info.flags)
+        }
+        rtspServer.sendVideo(trimmed, trimmedInfo)
+    }
+
+    /**
+     * Sets the scene mode and ISO of the open camera. The library has no API for them, so this
+     * gets the `android.hardware.Camera` by reflection: private field `cameraManager` of
+     * [Camera1Base], then private field `camera` of [Camera1ApiManager]. The names are from
+     * RootEncoder 2.8.1. Does nothing when the camera is not open. Sets the scene mode first,
+     * because a scene mode can change the ISO. A key that the camera does not have counts as
+     * "auto", so "auto" on such a camera does nothing. Throws RuntimeException or a reflection
+     * exception on failure.
+     */
+    @Suppress("DEPRECATION")
+    fun setSceneModeAndIso(sceneMode: String, iso: String) {
+        val managerField = Camera1Base::class.java.getDeclaredField("cameraManager").apply { isAccessible = true }
+        val manager = managerField.get(this) ?: return
+        val cameraField = Camera1ApiManager::class.java.getDeclaredField("camera").apply { isAccessible = true }
+        val camera = cameraField.get(manager) as? Camera ?: return
+        for ((key, value) in listOf("scene-mode" to sceneMode, "iso" to iso)) {
+            val p = camera.parameters
+            if ((p.get(key) ?: AUTO) == value) continue
+            p.set(key, value)
+            camera.parameters = p
+        }
+    }
+
+    override fun getStreamClient(): RtspServerStreamClient = RtspServerStreamClient(rtspServer)
+
+    override fun setVideoCodecImp(codec: VideoCodec) {
+        rtspServer.setVideoCodec(codec)
+    }
+
+    override fun setAudioCodecImp(codec: AudioCodec) {
+        rtspServer.setAudioCodec(codec)
+    }
+
+    companion object {
+        private const val TAG = "TrimmedRtspCamera"
+        private const val AUTO = "auto"
+    }
+}
